@@ -192,16 +192,98 @@ with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
     submit_btn = st.form_submit_button("Check Answer", use_container_width=True, disabled=st.session_state.answered)
 
 # LOGIC AFTER SUBMISSION - Back to LaBSE (Chinese to English comparison)
+# --- ENHANCED SCORING SECTION with better phrase matching ---
 if submit_btn and user_guess:
-    with st.spinner("Analyzing with LaBSE..."):
-        # LaBSE can directly compare Chinese character to English guess
+    with st.spinner("Analyzing with LaBSE + Smart Matching..."):
+        # Step 1: Get LaBSE similarity score
         scores = client.sentence_similarity(
-            sentence=current_item['char'],  # Chinese character (e.g., "早")
-            other_sentences=[user_guess],   # English guess (e.g., "morning")
+            sentence=current_item['char'],
+            other_sentences=[user_guess],
             model=MODEL_ID
         )
-        # Store results in session state so they survive the rerun
-        st.session_state.last_score = scores[0]
+        
+        final_score = scores[0]
+        
+        # Step 2: Enhanced definition matching (if below threshold)
+        if final_score < THRESHOLD:
+            user_lower = user_guess.lower().strip()
+            definition = current_item['def']
+            
+            # Split definition by semicolons
+            definition_parts = [part.strip().lower() for part in definition.split(';')]
+            all_definitions = definition_parts + [definition.lower()]
+            
+            match_found = False
+            matched_part = None
+            
+            for def_part in all_definitions:
+                # Exact match
+                if user_lower == def_part:
+                    match_found = True
+                    matched_part = def_part
+                    break
+                
+                # User's answer IN definition part (word/phrase contained)
+                if user_lower in def_part:
+                    match_found = True
+                    matched_part = def_part
+                    break
+                
+                # Definition part IN user's answer
+                if def_part in user_lower:
+                    match_found = True
+                    matched_part = def_part
+                    break
+                
+                # Check common words (ignoring stop words)
+                user_words = set(user_lower.split())
+                def_words = set(def_part.split())
+                
+                # If they share 70% of words (excluding short words)
+                stop_words = {'a', 'an', 'to', 'for', 'of', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing'}
+                user_filtered = {w for w in user_words if w not in stop_words and len(w) > 2}
+                def_filtered = {w for w in def_words if w not in stop_words and len(w) > 2}
+                
+                if user_filtered and def_filtered:
+                    common = user_filtered.intersection(def_filtered)
+                    if len(common) / max(len(user_filtered), len(def_filtered)) >= 0.5:
+                        match_found = True
+                        matched_part = def_part
+                        break
+                
+                # Check for synonym pairs (custom thesaurus for common cases)
+                synonym_pairs = [
+                    ('apply', 'request'),
+                    ('leave', 'leave of absence'),
+                    ('ask', 'request'),
+                    ('vacation', 'leave'),
+                    ('sick', 'leave'),
+                    ('permission', 'leave'),
+                ]
+                
+                for pair in synonym_pairs:
+                    if pair[0] in user_lower and pair[1] in def_part:
+                        match_found = True
+                        matched_part = def_part
+                        break
+                    if pair[1] in user_lower and pair[0] in def_part:
+                        match_found = True
+                        matched_part = def_part
+                        break
+            
+            # If match found, boost score
+            if match_found:
+                final_score = THRESHOLD + 0.05  # Boost to 0.75
+                st.session_state.keyword_match = True
+                st.session_state.matched_definition = matched_part
+            else:
+                st.session_state.keyword_match = False
+                st.session_state.matched_definition = None
+        else:
+            st.session_state.keyword_match = False
+            st.session_state.matched_definition = None
+        
+        st.session_state.last_score = final_score
         st.session_state.last_guess = user_guess 
         st.session_state.answered = True
         
@@ -209,18 +291,24 @@ if submit_btn and user_guess:
             st.session_state.count += 1
     st.rerun()
 
-# THE REVEAL PHASE
+# --- REVEAL PHASE (updated to show match type) ---
+# --- REVEAL PHASE (showing what matched) ---
 if st.session_state.answered:
     score = st.session_state.last_score
     st.divider()
     
-    # Show how the user's saved guess compared to the truth
     if score >= THRESHOLD:
-        st.success(f"✅ **Correct!** (Match: {score:.2f})")
+        if st.session_state.get('keyword_match', False):
+            st.success(f"✅ **Correct!** (Smart match: {score:.2f})")
+            if st.session_state.get('matched_definition'):
+                st.caption(f"🎯 Matched definition: *\"{st.session_state.matched_definition}\"*")
+        else:
+            st.success(f"✅ **Correct!** (LaBSE match: {score:.2f})")
     else:
         st.error(f"❌ **Not quite.** (Match: {score:.2f})")
+        # Show helpful hint
+        st.caption(f"💡 Hint: Try one of these: {current_item['def'][:50]}...")
     
-    # Display the results
     c1, c2 = st.columns([1, 2])
     with c1: 
         st.info(f"🔊 **{current_item['pinyin']}**")
@@ -231,7 +319,10 @@ if st.session_state.answered:
     if st.button("Next Word ➡️", type="primary", use_container_width=True):
         st.session_state.index += 1
         st.session_state.answered = False
-        # Clean up the last guess for the next round
         if 'last_guess' in st.session_state: 
             del st.session_state.last_guess
+        if 'keyword_match' in st.session_state:
+            del st.session_state.keyword_match
+        if 'matched_definition' in st.session_state:
+            del st.session_state.matched_definition
         st.rerun()
