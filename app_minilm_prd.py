@@ -13,16 +13,6 @@ client = InferenceClient(api_key=HF_API_KEY)
 MODEL_ID = "sentence-transformers/LaBSE"
 THRESHOLD = 0.7
 
-def load_audio_player():
-    st.components.v1.html("""
-        <script>
-            function playAudioFromBase64(b64) {
-                var audio = new Audio("data:audio/mp3;base64," + b64);
-                audio.play().catch(e => console.log("Audio error:", e));
-            }
-        </script>
-    """, height=0)
-
 # --- Function to normalize pinyin (fix nu:3 → nǚ) ---
 def normalize_pinyin(pinyin):
     """
