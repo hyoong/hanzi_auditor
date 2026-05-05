@@ -1,13 +1,112 @@
 import streamlit as st
 from huggingface_hub import InferenceClient
+from gtts import gTTS
+from io import BytesIO
 import json
 import random
+import base64
+import re
 
 # --- 1. CONFIG & CLIENT ---
 HF_API_KEY = st.secrets["HF_API_KEY"]
 client = InferenceClient(api_key=HF_API_KEY)
-MODEL_ID = "sentence-transformers/LaBSE"  # Back to LaBSE - built for cross-lingual!
-THRESHOLD = 0.7  # Fixed threshold
+MODEL_ID = "sentence-transformers/LaBSE"
+THRESHOLD = 0.7
+
+def load_audio_player():
+    st.components.v1.html("""
+        <script>
+            function playAudioFromBase64(b64) {
+                var audio = new Audio("data:audio/mp3;base64," + b64);
+                audio.play().catch(e => console.log("Audio error:", e));
+            }
+        </script>
+    """, height=0)
+
+# --- Function to normalize pinyin (fix nu:3 → nǚ) ---
+def normalize_pinyin(pinyin):
+    """
+    Convert pinyin with numbers and colons to proper tone marks
+    Examples:
+        nu:3 → nǚ
+        ni3 hao3 → nǐ hǎo
+        nu:2 ren2 → nǚ rén
+    """
+    if not pinyin:
+        return pinyin
+    
+    # First, replace colon with ü (for nü, lü, etc.)
+    pinyin = pinyin.replace('u:', 'ü').replace('U:', 'Ü')
+    
+    # Now convert tone numbers to marks
+    tone_marks = {
+        'a': ['ā', 'á', 'ǎ', 'à'],
+        'e': ['ē', 'é', 'ě', 'è'],
+        'i': ['ī', 'í', 'ǐ', 'ì'],
+        'o': ['ō', 'ó', 'ǒ', 'ò'],
+        'u': ['ū', 'ú', 'ǔ', 'ù'],
+        'ü': ['ǖ', 'ǘ', 'ǚ', 'ǜ']
+    }
+    
+    # Split into syllables
+    syllables = pinyin.split()
+    converted = []
+    
+    for syllable in syllables:
+        # Find tone number at the end
+        match = re.search(r'([a-zü]+)(\d)', syllable, re.IGNORECASE)
+        if match:
+            base, tone_num = match.groups()
+            tone = int(tone_num)
+            
+            if tone == 5:  # Neutral tone
+                converted.append(base)
+                continue
+            
+            # Find which vowel gets the tone mark
+            marked = False
+            for vowel in ['a', 'e', 'o']:
+                if vowel in base:
+                    pos = base.index(vowel)
+                    base = base[:pos] + tone_marks[vowel][tone-1] + base[pos+1:]
+                    marked = True
+                    break
+            
+            if not marked:
+                # Handle iu and ui special cases
+                if 'iu' in base:
+                    pos = base.index('u')
+                    base = base[:pos] + tone_marks['u'][tone-1] + base[pos+1:]
+                elif 'ui' in base:
+                    pos = base.index('i')
+                    base = base[:pos] + tone_marks['i'][tone-1] + base[pos+1:]
+                else:
+                    for vowel in ['i', 'u', 'ü']:
+                        if vowel in base:
+                            pos = base.index(vowel)
+                            base = base[:pos] + tone_marks[vowel][tone-1] + base[pos+1:]
+                            break
+                marked = True
+            
+            converted.append(base)
+        else:
+            converted.append(syllable.lower())
+    
+    return ' '.join(converted)
+
+# --- Function to generate and play audio (no caching, plays every time) ---
+
+def get_audio_base64(chinese_char):
+    try:
+        tts = gTTS(text=chinese_char, lang='zh', slow=False)
+        fp = BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        audio_bytes = fp.read()
+        return base64.b64encode(audio_bytes).decode()
+    except Exception as e:
+        print(f"Audio generation failed: {e}")
+        return ""
 
 # --- 2. DATA LOADING ---
 @st.cache_data
@@ -25,10 +124,8 @@ hsk_data = load_data()
 with st.sidebar:
     st.title("⚙️ Audit Settings")
     
-    # LOCK LOGIC: Lock if we have moved past the first word OR are currently viewing a result
     is_locked = st.session_state.get('index', 0) > 0 or st.session_state.get('answered', False)
     
-    # Always initialize these variables so they exist
     if 'temp_level' not in st.session_state:
         st.session_state.temp_level = list(hsk_data.keys())[0] if hsk_data else ""
     if 'temp_filter' not in st.session_state:
@@ -36,12 +133,10 @@ with st.sidebar:
     
     if is_locked:
         st.warning("🔒 Settings locked during Audit")
-        # Display current settings as read-only info
         st.write(f"Level: **{st.session_state.current_level}**")
         st.write(f"Type: **{st.session_state.current_filter}**")
         st.info(f"🤖 AI Strictness: **Fixed at {THRESHOLD}** (LaBSE cross-lingual model)")
     else:
-        # Everything is unlocked until the first 'Check Answer' is clicked
         level = st.selectbox(
             "Select HSK Level", 
             list(hsk_data.keys()),
@@ -53,60 +148,47 @@ with st.sidebar:
             key="filter_select"
         )
         
-        # Show fixed threshold as info
         st.info(f"🤖 AI Similarity Threshold: **Fixed at {THRESHOLD}** (LaBSE cross-lingual model)")
         
-        # Store these in temporary variables to check for changes
         st.session_state.temp_level = level
         st.session_state.temp_filter = length_filter
         
-        # Only update current settings if we haven't started or if settings changed
         if ('current_level' not in st.session_state or 
             'current_filter' not in st.session_state or
             st.session_state.current_level != level or 
             st.session_state.current_filter != length_filter):
             st.session_state.current_level = level
             st.session_state.current_filter = length_filter
-            # Force word list regeneration
             if 'word_list' in st.session_state:
                 del st.session_state.word_list
 
     st.divider()
     
-    # RESTART / RESET (Always available)
     if st.button("🔄 Reset & Change Level", use_container_width=True):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
 
-    # END GAME EARLY BUTTON
     if is_locked and not st.session_state.get('game_over', False):
         if st.button("🛑 End Audit Early", type="secondary", use_container_width=True):
             st.session_state.game_over = True
             st.rerun()
 
 # --- 4. SESSION INITIALIZATION ---
-
-# Check if settings have changed before locking
 settings_changed = False
 if not is_locked and 'current_level' in st.session_state and 'current_filter' in st.session_state:
-    # Compare current settings with selected values from sidebar
     selected_level = st.session_state.get('temp_level', st.session_state.current_level)
     selected_filter = st.session_state.get('temp_filter', st.session_state.current_filter)
     
     if (selected_level != st.session_state.current_level or 
         selected_filter != st.session_state.current_filter):
         settings_changed = True
-        # Update to new settings
         st.session_state.current_level = selected_level
         st.session_state.current_filter = selected_filter
-        # Clear word list to force regeneration
         if 'word_list' in st.session_state:
             del st.session_state.word_list
 
-# If it's a brand new session OR settings changed, (re)initialize the word list
 if 'word_list' not in st.session_state or settings_changed:
-    # Make sure current_level is set
     if 'current_level' not in st.session_state or st.session_state.current_level not in hsk_data:
         if hsk_data:
             st.session_state.current_level = list(hsk_data.keys())[0]
@@ -128,7 +210,6 @@ if 'word_list' not in st.session_state or settings_changed:
         st.error(f"No words match the filter '{st.session_state.current_filter}' in level {st.session_state.current_level}!")
         st.stop()
 
-    # Create the full randomized deck
     random.shuffle(pool)
     st.session_state.word_list = pool
     st.session_state.index = 0
@@ -152,7 +233,6 @@ if st.session_state.get('game_over', False) or st.session_state.index >= len(st.
     total_in_level = len(st.session_state.word_list)
     correct = st.session_state.count
     
-    # Progress check for qualification
     qualification_threshold = int(total_in_level * 0.20)
     
     col1, col2 = st.columns(2)
@@ -177,11 +257,18 @@ if st.session_state.get('game_over', False) or st.session_state.index >= len(st.
 # --- 7. ACTIVE GAME UI ---
 current_item = st.session_state.word_list[st.session_state.index]
 
+# Normalize the pinyin for later display (but we won't show it until after answering)
+display_pinyin = normalize_pinyin(current_item.get('pinyin', ''))
+
 st.title(f"🏮 {st.session_state.current_level} Audit")
 st.write(f"Word **{st.session_state.index + 1}** of **{len(st.session_state.word_list)}**")
+
+# Display Chinese character ONLY (no pinyin text before answering)
 st.markdown(f"<h1 style='text-align: center; font-size: 120px; color: #E63946;'>{current_item['char']}</h1>", unsafe_allow_html=True)
 
-# We set clear_on_submit to FALSE so the word stays visible after hitting Enter
+# NO pinyin text displayed here before answering!
+
+# Form for user input
 with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
     user_guess = st.text_input(
         "Meaning in English:", 
@@ -191,11 +278,9 @@ with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
     
     submit_btn = st.form_submit_button("Check Answer", use_container_width=True, disabled=st.session_state.answered)
 
-# LOGIC AFTER SUBMISSION - Back to LaBSE (Chinese to English comparison)
-# --- ENHANCED SCORING SECTION with better phrase matching ---
+# LOGIC AFTER SUBMISSION
 if submit_btn and user_guess:
     with st.spinner("Analyzing with LaBSE + Smart Matching..."):
-        # Step 1: Get LaBSE similarity score
         scores = client.sentence_similarity(
             sentence=current_item['char'],
             other_sentences=[user_guess],
@@ -204,76 +289,22 @@ if submit_btn and user_guess:
         
         final_score = scores[0]
         
-        # Step 2: Enhanced definition matching (if below threshold)
         if final_score < THRESHOLD:
             user_lower = user_guess.lower().strip()
             definition = current_item['def']
-            
-            # Split definition by semicolons
             definition_parts = [part.strip().lower() for part in definition.split(';')]
-            all_definitions = definition_parts + [definition.lower()]
             
             match_found = False
             matched_part = None
             
-            for def_part in all_definitions:
-                # Exact match
-                if user_lower == def_part:
+            for def_part in definition_parts:
+                if user_lower == def_part or user_lower in def_part or def_part in user_lower:
                     match_found = True
                     matched_part = def_part
                     break
-                
-                # User's answer IN definition part (word/phrase contained)
-                if user_lower in def_part:
-                    match_found = True
-                    matched_part = def_part
-                    break
-                
-                # Definition part IN user's answer
-                if def_part in user_lower:
-                    match_found = True
-                    matched_part = def_part
-                    break
-                
-                # Check common words (ignoring stop words)
-                user_words = set(user_lower.split())
-                def_words = set(def_part.split())
-                
-                # If they share 70% of words (excluding short words)
-                stop_words = {'a', 'an', 'to', 'for', 'of', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing'}
-                user_filtered = {w for w in user_words if w not in stop_words and len(w) > 2}
-                def_filtered = {w for w in def_words if w not in stop_words and len(w) > 2}
-                
-                if user_filtered and def_filtered:
-                    common = user_filtered.intersection(def_filtered)
-                    if len(common) / max(len(user_filtered), len(def_filtered)) >= 0.5:
-                        match_found = True
-                        matched_part = def_part
-                        break
-                
-                # Check for synonym pairs (custom thesaurus for common cases)
-                synonym_pairs = [
-                    ('apply', 'request'),
-                    ('leave', 'leave of absence'),
-                    ('ask', 'request'),
-                    ('vacation', 'leave'),
-                    ('sick', 'leave'),
-                    ('permission', 'leave'),
-                ]
-                
-                for pair in synonym_pairs:
-                    if pair[0] in user_lower and pair[1] in def_part:
-                        match_found = True
-                        matched_part = def_part
-                        break
-                    if pair[1] in user_lower and pair[0] in def_part:
-                        match_found = True
-                        matched_part = def_part
-                        break
             
-            # If match found, boost score
             if match_found:
-                final_score = THRESHOLD + 0.05  # Boost to 0.75
+                final_score = THRESHOLD + 0.05
                 st.session_state.keyword_match = True
                 st.session_state.matched_definition = matched_part
             else:
@@ -291,8 +322,7 @@ if submit_btn and user_guess:
             st.session_state.count += 1
     st.rerun()
 
-# --- REVEAL PHASE (updated to show match type) ---
-# --- REVEAL PHASE (showing what matched) ---
+# --- REVEAL PHASE (Pinyin and Audio shown ONLY after answering) ---
 if st.session_state.answered:
     score = st.session_state.last_score
     st.divider()
@@ -306,20 +336,34 @@ if st.session_state.answered:
             st.success(f"✅ **Correct!** (LaBSE match: {score:.2f})")
     else:
         st.error(f"❌ **Not quite.** (Match: {score:.2f})")
-        # Show helpful hint
         st.caption(f"💡 Hint: Try one of these: {current_item['def'][:50]}...")
     
-    c1, c2 = st.columns([1, 2])
-    with c1: 
-        st.info(f"🔊 **{current_item['pinyin']}**")
-    with c2: 
-        st.markdown(f"**Your Guess:** `{st.session_state.last_guess}`")
-        st.markdown(f"**Official Meanings:**\n> {current_item['def']}")
+    # Display pinyin and audio together (only after answering)
+    col1, col2, col3 = st.columns([2, 1, 2])
+    
+    with col1:
+        st.info(f"📖 **Pinyin:** {display_pinyin}")
+    
+    with col2:
+            if st.button("🔊", key=f"audio_reveal_{st.session_state.index}", help="Click to hear pronunciation"):
+                b64 = get_audio_base64(current_item['char'])
+                if b64:
+                    # Use st.components.v1.html with an autoplaying audio tag instead of a script tag
+                    st.components.v1.html(f"""
+                        <audio autoplay>
+                            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                        </audio>
+                    """, height=0)
 
+    with col3:
+        st.markdown(f"**Your Guess:** `{st.session_state.last_guess}`")
+    
+    st.markdown(f"**Official Meanings:**\n> {current_item['def']}")
+    
     if st.button("Next Word ➡️", type="primary", use_container_width=True):
         st.session_state.index += 1
         st.session_state.answered = False
-        if 'last_guess' in st.session_state: 
+        if 'last_guess' in st.session_state:
             del st.session_state.last_guess
         if 'keyword_match' in st.session_state:
             del st.session_state.keyword_match
