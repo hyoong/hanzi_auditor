@@ -6,6 +6,7 @@ import json
 import random
 import base64
 import re
+import time 
 
 # --- 1. CONFIG & CLIENT ---
 HF_API_KEY = st.secrets["HF_API_KEY"]
@@ -333,18 +334,22 @@ if st.session_state.answered:
     
     with col1:
         st.info(f"📖 **Pinyin:** {display_pinyin}")
-    
+
     with col2:
-            if st.button("🔊", key=f"audio_reveal_{st.session_state.index}", help="Click to hear pronunciation"):
-                b64 = get_audio_base64(current_item['char'])
-                if b64:
-                    # Use st.components.v1.html with an autoplaying audio tag instead of a script tag
-                    st.components.v1.html(f"""
+        if st.button("🔊", key=f"audio_reveal_{st.session_state.index}"):
+            b64 = get_audio_base64(current_item['char'])
+            if b64:
+                # We add a unique timestamp to the HTML to force a re-render/re-play
+                # We use st.logo or a container if needed, but st.components.v1.html is still 
+                # the standard until the June 2026 cutoff. Let's use the unique ID trick:
+                unique_id = time.time()
+                st.components.v1.html(f"""
+                    <div id="{unique_id}">
                         <audio autoplay>
                             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
                         </audio>
-                    """, height=0)
-
+                    </div>
+                """, height=0)
     with col3:
         st.markdown(f"**Your Guess:** `{st.session_state.last_guess}`")
     
