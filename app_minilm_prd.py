@@ -86,7 +86,6 @@ def normalize_pinyin(pinyin):
     return ' '.join(converted)
 
 # --- Function to generate and play audio (no caching, plays every time) ---
-
 def get_audio_base64(chinese_char):
     try:
         tts = gTTS(text=chinese_char, lang='zh', slow=False)
@@ -110,6 +109,49 @@ def load_data():
         return {}
 
 hsk_data = load_data()
+
+# ======================= NEW: URL PERSISTENCE FUNCTIONS =======================
+def save_state_to_url():
+    """Write current session state to query parameters."""
+    qp = st.query_params
+    qp.clear()
+    qp["seed"] = str(st.session_state.get("shuffle_seed", ""))
+    qp["level"] = st.session_state.get("current_level", "")
+    qp["word_filter"] = st.session_state.get("current_filter", "")
+    qp["index"] = str(st.session_state.get("index", 0))
+    qp["count"] = str(st.session_state.get("count", 0))
+    qp["answered"] = str(st.session_state.get("answered", False))
+    qp["last_guess"] = st.session_state.get("last_guess", "")
+    qp["last_score"] = str(st.session_state.get("last_score", 0.0))
+    qp["keyword_match"] = str(st.session_state.get("keyword_match", False))
+    qp["matched_definition"] = st.session_state.get("matched_definition", "")
+
+def load_state_from_url():
+    """Restore session state from URL parameters. Returns True if restored."""
+    qp = st.query_params
+    if "seed" not in qp:
+        return False
+
+    try:
+        st.session_state.shuffle_seed = int(qp["seed"])
+        st.session_state.current_level = qp["level"]
+        st.session_state.current_filter = qp["word_filter"]
+        st.session_state.index = int(qp["index"])
+        st.session_state.count = int(qp["count"])
+        st.session_state.answered = qp["answered"].lower() == "true"
+        st.session_state.last_guess = qp["last_guess"]
+        st.session_state.last_score = float(qp["last_score"])
+        st.session_state.keyword_match = qp["keyword_match"].lower() == "true"
+        st.session_state.matched_definition = qp["matched_definition"]
+        return True
+    except Exception:
+        # Invalid URL state → start fresh
+        return False
+
+def clear_url_state():
+    st.query_params.clear()
+
+# ============================================================================
 
 # --- 3. SIDEBAR & SETTINGS ---
 with st.sidebar:
@@ -152,46 +194,53 @@ with st.sidebar:
             st.session_state.current_filter = length_filter
             if 'word_list' in st.session_state:
                 del st.session_state.word_list
+            clear_url_state()   # level changed → discard old URL state
 
     st.divider()
     
     if st.button("🔄 Reset & Change Level", use_container_width=True):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
+        clear_url_state()
         st.rerun()
 
     if is_locked and not st.session_state.get('game_over', False):
         if st.button("🛑 End Audit Early", type="secondary", use_container_width=True):
             st.session_state.game_over = True
+            clear_url_state()
             st.rerun()
 
-# --- 4. SESSION INITIALIZATION ---
-settings_changed = False
-if not is_locked and 'current_level' in st.session_state and 'current_filter' in st.session_state:
-    selected_level = st.session_state.get('temp_level', st.session_state.current_level)
-    selected_filter = st.session_state.get('temp_filter', st.session_state.current_filter)
-    
-    if (selected_level != st.session_state.current_level or 
-        selected_filter != st.session_state.current_filter):
-        settings_changed = True
-        st.session_state.current_level = selected_level
-        st.session_state.current_filter = selected_filter
-        if 'word_list' in st.session_state:
-            del st.session_state.word_list
+# --- 4. SESSION INITIALIZATION (with URL restore) ---
+# Try to restore from URL first
+restored = load_state_from_url()
 
-if 'word_list' not in st.session_state or settings_changed:
+if not restored:
+    # Fresh session: generate random seed and set default level/filter
+    st.session_state.shuffle_seed = random.randint(1, 10**6)
     if 'current_level' not in st.session_state or st.session_state.current_level not in hsk_data:
         if hsk_data:
             st.session_state.current_level = list(hsk_data.keys())[0]
         else:
             st.error("No data available!")
             st.stop()
-    
     if 'current_filter' not in st.session_state:
         st.session_state.current_filter = "Any"
-    
+    if 'word_list' in st.session_state:
+        del st.session_state.word_list   # force rebuild
+
+# Ensure mandatory keys exist
+st.session_state.setdefault('index', 0)
+st.session_state.setdefault('count', 0)
+st.session_state.setdefault('answered', False)
+st.session_state.setdefault('game_over', False)
+st.session_state.setdefault('last_guess', "")
+st.session_state.setdefault('last_score', 0.0)
+st.session_state.setdefault('keyword_match', False)
+st.session_state.setdefault('matched_definition', None)
+
+# --- Build word list with deterministic shuffle ---
+if 'word_list' not in st.session_state:
     pool = hsk_data.get(st.session_state.current_level, [])
-    
     if st.session_state.current_filter == "Single Characters Only":
         pool = [w for w in pool if len(w['char']) == 1]
     elif st.session_state.current_filter == "Compounds (2+ chars)":
@@ -201,12 +250,23 @@ if 'word_list' not in st.session_state or settings_changed:
         st.error(f"No words match the filter '{st.session_state.current_filter}' in level {st.session_state.current_level}!")
         st.stop()
 
-    random.shuffle(pool)
+    # Use the stored seed for reproducible shuffle
+    random.Random(st.session_state.shuffle_seed).shuffle(pool)
     st.session_state.word_list = pool
+    # Reset progress counters for fresh list (if not restored)
     st.session_state.index = 0
     st.session_state.count = 0
     st.session_state.answered = False
     st.session_state.game_over = False
+    # Clear any leftover answer details
+    for k in ['last_guess', 'last_score', 'keyword_match', 'matched_definition']:
+        if k in st.session_state:
+            del st.session_state[k]
+    save_state_to_url()
+
+# If we restored a session that had already finished, ensure game_over is set
+if st.session_state.index >= len(st.session_state.word_list):
+    st.session_state.game_over = True
 
 # --- 5. SCORE CALCULATION FUNCTION ---
 def get_grade(percentage):
@@ -216,7 +276,7 @@ def get_grade(percentage):
     return "Needs more work 📚"
 
 # --- 6. GAME OVER UI ---
-if st.session_state.get('game_over', False) or st.session_state.index >= len(st.session_state.word_list):
+if st.session_state.get('game_over', False):
     st.balloons()
     st.header("🏁 Audit Results")
     
@@ -224,7 +284,7 @@ if st.session_state.get('game_over', False) or st.session_state.index >= len(st.
     total_in_level = len(st.session_state.word_list)
     correct = st.session_state.count
     
-    qualification_threshold = int(total_in_level * 0.20)
+    qualification_threshold = max(1, int(total_in_level * 0.20))
     
     col1, col2 = st.columns(2)
     col1.metric("Correct Answers", f"{correct} / {words_played}")
@@ -242,6 +302,7 @@ if st.session_state.get('game_over', False) or st.session_state.index >= len(st.
     if st.button("Start New Audit", type="primary"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
+        clear_url_state()
         st.rerun()
     st.stop()
 
@@ -261,8 +322,11 @@ st.markdown(f"<h1 style='text-align: center; font-size: 120px; color: #E63946;'>
 
 # Form for user input
 with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
+    # Restore previous guess if available
+    default_value = st.session_state.last_guess if st.session_state.answered else ""
     user_guess = st.text_input(
         "Meaning in English:", 
+        value=default_value,
         key=f"user_input_{st.session_state.index}", 
         disabled=st.session_state.answered
     )
@@ -311,6 +375,8 @@ if submit_btn and user_guess:
         
         if st.session_state.last_score >= THRESHOLD:
             st.session_state.count += 1
+
+    save_state_to_url()   # Persist after answer
     st.rerun()
 
 # --- REVEAL PHASE (Pinyin and Audio shown ONLY after answering) ---
@@ -339,9 +405,6 @@ if st.session_state.answered:
         if st.button("🔊", key=f"audio_reveal_{st.session_state.index}"):
             b64 = get_audio_base64(current_item['char'])
             if b64:
-                # We add a unique timestamp to the HTML to force a re-render/re-play
-                # We use st.logo or a container if needed, but st.components.v1.html is still 
-                # the standard until the June 2026 cutoff. Let's use the unique ID trick:
                 unique_id = time.time()
                 st.components.v1.html(f"""
                     <div id="{unique_id}">
@@ -364,4 +427,5 @@ if st.session_state.answered:
             del st.session_state.keyword_match
         if 'matched_definition' in st.session_state:
             del st.session_state.matched_definition
+        save_state_to_url()   # Persist after moving to next word
         st.rerun()
