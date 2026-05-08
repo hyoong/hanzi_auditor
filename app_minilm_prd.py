@@ -85,7 +85,7 @@ def normalize_pinyin(pinyin):
     
     return ' '.join(converted)
 
-# --- Function to generate and play audio (no caching, plays every time) ---
+# --- Function to generate and play audio ---
 def get_audio_base64(chinese_char):
     try:
         tts = gTTS(text=chinese_char, lang='zh', slow=False)
@@ -98,19 +98,77 @@ def get_audio_base64(chinese_char):
         print(f"Audio generation failed: {e}")
         return ""
 
-# --- 2. DATA LOADING ---
-@st.cache_data
-def load_data():
-    try:
-        with open('hsk_audit_v2.json', 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.error("Missing 'hsk_audit_v2.json'! Run your transform script first.")
-        return {}
+# ======================= NEW: ROBUST SMART MATCHING =======================
+def normalize_text(text):
+    """
+    Normalize text for comparison:
+    - Lowercase
+    - Expand common contractions (you're -> you are, etc.)
+    - Remove punctuation
+    - Strip extra spaces
+    """
+    text = text.lower().strip()
+    # Contraction mapping
+    contractions = {
+        "you're": "you are",
+        "don't": "do not",
+        "can't": "cannot",
+        "i'm": "i am",
+        "we're": "we are",
+        "they're": "they are",
+        "isn't": "is not",
+        "aren't": "are not",
+        "wasn't": "was not",
+        "weren't": "were not",
+        "won't": "will not",
+        "wouldn't": "would not",
+        "couldn't": "could not",
+        "shouldn't": "should not",
+        "it's": "it is",
+        "that's": "that is",
+        "what's": "what is",
+        "where's": "where is",
+        "who's": "who is",
+        "let's": "let us",
+        "ain't": "am not",
+        "ma'am": "madam"
+    }
+    for contr, expanded in contractions.items():
+        text = text.replace(contr, expanded)
+    # Remove punctuation (keep letters, numbers, spaces)
+    text = re.sub(r'[^\w\s]', '', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-hsk_data = load_data()
+def is_semantic_match(user_guess, definition_part):
+    """
+    Returns True if user_guess matches definition_part semantically.
+    Rules (in order):
+    1. Exact match after normalization (contractions expanded, punctuation removed)
+    2. Token subset: every word in user guess appears in definition (order ignored)
+    3. Short word (≤3 chars) matches if it appears as a whole token in definition
+    """
+    norm_user = normalize_text(user_guess)
+    norm_def = normalize_text(definition_part)
+    
+    # 1. Exact match
+    if norm_user == norm_def:
+        return True
+    
+    # 2. Token subset: all user tokens must be present in definition tokens
+    user_tokens = set(norm_user.split())
+    def_tokens = set(norm_def.split())
+    if user_tokens and user_tokens.issubset(def_tokens):
+        return True
+    
+    # 3. Short word match (1-3 characters) – user guess is a single short token
+    if len(norm_user) <= 3 and norm_user in def_tokens:
+        return True
+    
+    return False
 
-# ======================= NEW: URL PERSISTENCE FUNCTIONS =======================
+# ======================= URL PERSISTENCE FUNCTIONS =======================
 def save_state_to_url():
     """Write current session state to query parameters."""
     qp = st.query_params
@@ -131,7 +189,6 @@ def load_state_from_url():
     qp = st.query_params
     if "seed" not in qp:
         return False
-
     try:
         st.session_state.shuffle_seed = int(qp["seed"])
         st.session_state.current_level = qp["level"]
@@ -145,13 +202,22 @@ def load_state_from_url():
         st.session_state.matched_definition = qp["matched_definition"]
         return True
     except Exception:
-        # Invalid URL state → start fresh
         return False
 
 def clear_url_state():
     st.query_params.clear()
 
-# ============================================================================
+# --- 2. DATA LOADING ---
+@st.cache_data
+def load_data():
+    try:
+        with open('hsk_audit_v2.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        st.error("Missing 'hsk_audit_v2.json'! Run your transform script first.")
+        return {}
+
+hsk_data = load_data()
 
 # --- 3. SIDEBAR & SETTINGS ---
 with st.sidebar:
@@ -194,7 +260,7 @@ with st.sidebar:
             st.session_state.current_filter = length_filter
             if 'word_list' in st.session_state:
                 del st.session_state.word_list
-            clear_url_state()   # level changed → discard old URL state
+            clear_url_state()
 
     st.divider()
     
@@ -211,11 +277,9 @@ with st.sidebar:
             st.rerun()
 
 # --- 4. SESSION INITIALIZATION (with URL restore) ---
-# Try to restore from URL first
 restored = load_state_from_url()
 
 if not restored:
-    # Fresh session: generate random seed and set default level/filter
     st.session_state.shuffle_seed = random.randint(1, 10**6)
     if 'current_level' not in st.session_state or st.session_state.current_level not in hsk_data:
         if hsk_data:
@@ -226,9 +290,8 @@ if not restored:
     if 'current_filter' not in st.session_state:
         st.session_state.current_filter = "Any"
     if 'word_list' in st.session_state:
-        del st.session_state.word_list   # force rebuild
+        del st.session_state.word_list
 
-# Ensure mandatory keys exist
 st.session_state.setdefault('index', 0)
 st.session_state.setdefault('count', 0)
 st.session_state.setdefault('answered', False)
@@ -238,7 +301,7 @@ st.session_state.setdefault('last_score', 0.0)
 st.session_state.setdefault('keyword_match', False)
 st.session_state.setdefault('matched_definition', None)
 
-# --- Build word list with deterministic shuffle ---
+# Build word list with deterministic shuffle
 if 'word_list' not in st.session_state:
     pool = hsk_data.get(st.session_state.current_level, [])
     if st.session_state.current_filter == "Single Characters Only":
@@ -250,21 +313,17 @@ if 'word_list' not in st.session_state:
         st.error(f"No words match the filter '{st.session_state.current_filter}' in level {st.session_state.current_level}!")
         st.stop()
 
-    # Use the stored seed for reproducible shuffle
     random.Random(st.session_state.shuffle_seed).shuffle(pool)
     st.session_state.word_list = pool
-    # Reset progress counters for fresh list (if not restored)
     st.session_state.index = 0
     st.session_state.count = 0
     st.session_state.answered = False
     st.session_state.game_over = False
-    # Clear any leftover answer details
     for k in ['last_guess', 'last_score', 'keyword_match', 'matched_definition']:
         if k in st.session_state:
             del st.session_state[k]
     save_state_to_url()
 
-# If we restored a session that had already finished, ensure game_over is set
 if st.session_state.index >= len(st.session_state.word_list):
     st.session_state.game_over = True
 
@@ -308,21 +367,13 @@ if st.session_state.get('game_over', False):
 
 # --- 7. ACTIVE GAME UI ---
 current_item = st.session_state.word_list[st.session_state.index]
-
-# Normalize the pinyin for later display (but we won't show it until after answering)
 display_pinyin = normalize_pinyin(current_item.get('pinyin', ''))
 
 st.title(f"🏮 {st.session_state.current_level} Audit")
 st.write(f"Word **{st.session_state.index + 1}** of **{len(st.session_state.word_list)}**")
-
-# Display Chinese character ONLY (no pinyin text before answering)
 st.markdown(f"<h1 style='text-align: center; font-size: 120px; color: #E63946;'>{current_item['char']}</h1>", unsafe_allow_html=True)
 
-# NO pinyin text displayed here before answering!
-
-# Form for user input
 with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
-    # Restore previous guess if available
     default_value = st.session_state.last_guess if st.session_state.answered else ""
     user_guess = st.text_input(
         "Meaning in English:", 
@@ -330,10 +381,9 @@ with st.form(key=f"audit_form_{st.session_state.index}", clear_on_submit=False):
         key=f"user_input_{st.session_state.index}", 
         disabled=st.session_state.answered
     )
-    
     submit_btn = st.form_submit_button("Check Answer", use_container_width=True, disabled=st.session_state.answered)
 
-# LOGIC AFTER SUBMISSION
+# LOGIC AFTER SUBMISSION (with enhanced smart matching)
 if submit_btn and user_guess:
     with st.spinner("Analyzing with LaBSE + Smart Matching..."):
         scores = client.sentence_similarity(
@@ -341,19 +391,19 @@ if submit_btn and user_guess:
             other_sentences=[user_guess],
             model=MODEL_ID
         )
-        
         final_score = scores[0]
         
+        # If LaBSE score is low, try improved semantic matching
         if final_score < THRESHOLD:
             user_lower = user_guess.lower().strip()
             definition = current_item['def']
-            definition_parts = [part.strip().lower() for part in definition.split(';')]
+            definition_parts = [part.strip() for part in definition.split(';')]
             
             match_found = False
             matched_part = None
             
             for def_part in definition_parts:
-                if user_lower == def_part or user_lower in def_part or def_part in user_lower:
+                if is_semantic_match(user_lower, def_part):
                     match_found = True
                     matched_part = def_part
                     break
@@ -376,10 +426,10 @@ if submit_btn and user_guess:
         if st.session_state.last_score >= THRESHOLD:
             st.session_state.count += 1
 
-    save_state_to_url()   # Persist after answer
+    save_state_to_url()
     st.rerun()
 
-# --- REVEAL PHASE (Pinyin and Audio shown ONLY after answering) ---
+# --- REVEAL PHASE ---
 if st.session_state.answered:
     score = st.session_state.last_score
     st.divider()
@@ -395,12 +445,9 @@ if st.session_state.answered:
         st.error(f"❌ **Not quite.** (Match: {score:.2f})")
         st.caption(f"💡 Hint: Try one of these: {current_item['def'][:50]}...")
     
-    # Display pinyin and audio together (only after answering)
     col1, col2, col3 = st.columns([2, 1, 2])
-    
     with col1:
         st.info(f"📖 **Pinyin:** {display_pinyin}")
-
     with col2:
         if st.button("🔊", key=f"audio_reveal_{st.session_state.index}"):
             b64 = get_audio_base64(current_item['char'])
@@ -421,11 +468,8 @@ if st.session_state.answered:
     if st.button("Next Word ➡️", type="primary", use_container_width=True):
         st.session_state.index += 1
         st.session_state.answered = False
-        if 'last_guess' in st.session_state:
-            del st.session_state.last_guess
-        if 'keyword_match' in st.session_state:
-            del st.session_state.keyword_match
-        if 'matched_definition' in st.session_state:
-            del st.session_state.matched_definition
-        save_state_to_url()   # Persist after moving to next word
+        for k in ['last_guess', 'last_score', 'keyword_match', 'matched_definition']:
+            if k in st.session_state:
+                del st.session_state[k]
+        save_state_to_url()
         st.rerun()
